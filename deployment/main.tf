@@ -18,6 +18,14 @@ terraform {
       source  = "hashicorp/time"
       version = "0.12.1"
     }
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "~> 2.25.0"
+    }
+    helm = {
+      source  = "hashicorp/helm"
+      version = "~> 2.12.0"
+    }
   }
 }
 
@@ -155,14 +163,25 @@ data "azurerm_kubernetes_cluster" "primary" {
   resource_group_name = azurerm_kubernetes_cluster.primary.resource_group_name
 }
 
-# NOTE: The data block above is used to configured the kubernetes provider
+# NOTE: The data block above is used to configure the kubernetes provider
 # correctly, by adding a layer of indirectness. This is because of:
 # https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs#stacking-with-managed-kubernetes-cluster-resources
+
+# Configure both the Kubernetes and Helm providers to use the same AKS cluster credentials
 provider "kubernetes" {
   host                   = data.azurerm_kubernetes_cluster.primary.kube_config[0].host
   client_certificate     = base64decode(data.azurerm_kubernetes_cluster.primary.kube_config[0].client_certificate)
   client_key             = base64decode(data.azurerm_kubernetes_cluster.primary.kube_config[0].client_key)
   cluster_ca_certificate = base64decode(data.azurerm_kubernetes_cluster.primary.kube_config[0].cluster_ca_certificate)
+}
+
+provider "helm" {
+  kubernetes {
+    host                   = data.azurerm_kubernetes_cluster.primary.kube_config[0].host
+    client_certificate     = base64decode(data.azurerm_kubernetes_cluster.primary.kube_config[0].client_certificate)
+    client_key             = base64decode(data.azurerm_kubernetes_cluster.primary.kube_config[0].client_key)
+    cluster_ca_certificate = base64decode(data.azurerm_kubernetes_cluster.primary.kube_config[0].cluster_ca_certificate)
+  }
 }
 
 resource "kubernetes_namespace" "crs-ns" {
