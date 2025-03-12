@@ -2,6 +2,10 @@ example-crs-architecture/
 
 .terraform/
 errored.tfstate
+*.tfvars
+*.tfstate
+*.tfstate.backup
+.terraform.lock.hcl
 
 ## Localized environment variables
 **/.env
