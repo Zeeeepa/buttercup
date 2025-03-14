@@ -102,3 +102,19 @@ variable "task_server_loadbalancer_source_ranges" {
   description = "List of CIDR blocks that can access the task server"
   default     = []
 }
+
+
+variable "email_address" {
+  description = "Email address for Let's Encrypt certificates"
+  type        = string
+  default     = "aixcc@trailofbits.com"
+}
+
+variable "use_production_certificates" {
+  description = "Whether to use Let's Encrypt production certificates (true) or staging certificates (false)"
+  type        = bool
+  default     = false
+}
+
+# Note: Authentication to Azure is now handled via ambient Azure CLI credentials
+# from az login and ARM_SUBSCRIPTION_ID environment variable

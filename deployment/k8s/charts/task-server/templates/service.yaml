@@ -1,3 +1,5 @@
+{{- if ne $.Values.global.environment "aks" }}
+# For non-AKS environments, use NodePort
 apiVersion: v1
 kind: Service
 metadata:
@@ -9,21 +11,35 @@ metadata:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  # Set type based on environment
-  type: {{ if eq $.Values.global.environment "aks" }}LoadBalancer{{ else }}NodePort{{ end }}
+  type: NodePort
   ports:
     - port: {{ .Values.service.port }}
       targetPort: {{ .Values.port }}
       protocol: TCP
       name: http
-      # Add nodePort only for NodePort service type (minikube)
-      {{- if and (ne $.Values.global.environment "aks") .Values.service.nodePort }}
+      {{- if .Values.service.nodePort }}
       nodePort: {{ .Values.service.nodePort }}
       {{- end }}
   selector:
     app: task-server
-  # Add loadBalancerSourceRanges only for LoadBalancer service type (AKS)
-  {{- if and (eq $.Values.global.environment "aks") .Values.service.loadBalancerSourceRanges }}
-  loadBalancerSourceRanges:
-    {{- toYaml .Values.service.loadBalancerSourceRanges | nindent 4 }}
-  {{- end }} 
+{{- end }}
+
+{{- if eq $.Values.global.environment "aks" }}
+# For AKS environment, create a ClusterIP service to work with Ingress
+# Using name without release prefix to match ingress configuration
+apiVersion: v1
+kind: Service
+metadata:
+  name: task-server
+  labels:
+    app: task-server
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: {{ .Values.port }}
+      protocol: TCP
+      name: http
+  selector:
+    app: task-server
+{{- end }} 

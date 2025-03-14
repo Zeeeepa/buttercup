@@ -40,3 +40,12 @@ output "kube_config" {
   value     = azurerm_kubernetes_cluster.primary.kube_config_raw
   sensitive = true
 }
+
+output "aks_fqdn" {
+  value = azurerm_kubernetes_cluster.primary.fqdn
+}
+
+output "certificate_domain" {
+  value = local.certificate_domain
+  description = "Domain name used for the TLS certificate"
+}

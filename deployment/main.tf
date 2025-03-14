@@ -20,7 +20,7 @@ terraform {
     }
     kubernetes = {
       source  = "hashicorp/kubernetes"
-      version = "~> 2.25.0"
+      version = "~> 2.35.0"
     }
     helm = {
       source  = "hashicorp/helm"
@@ -32,11 +32,8 @@ terraform {
 
 provider "azurerm" {
   features {}
-  #Can setup your service principal here, currently commented out to use az cli apply terraform
-  #subscription_id   = "<azure_subscription_id>"
-  #tenant_id         = "<azure_subscription_tenant_id>"
-  #client_id         = "<service_principal_appid>"
-  #client_secret     = "<service_principal_password>"
+  # Use ambient Azure CLI credentials from az login
+  # Not specifying client_id/client_secret when using Azure CLI authentication
 }
 
 #resource for random prefixes, helps with unique names and identifiers
@@ -188,6 +185,7 @@ resource "kubernetes_namespace" "crs-ns" {
   metadata {
     name = "crs"
   }
+  depends_on = [null_resource.setup_kubectl]
 }
 
 resource "kubernetes_secret" "ghcr_auth" {
@@ -207,55 +205,187 @@ resource "kubernetes_secret" "ghcr_auth" {
   }
 }
 
-# Orchestrator is now deployed via Helm chart in buttercup.tf
-# resource "kubernetes_deployment" "orchestrator" {
-#   metadata {
-#     name      = "orchestrator"
-#     namespace = kubernetes_namespace.crs-ns.metadata.0.name
-#   }
-#   spec {
-#     replicas = 2
-#     selector {
-#       match_labels = {
-#         app = "orchestrator"
-#       }
-#     }
-#     template {
-#       metadata {
-#         labels = {
-#           app = "orchestrator"
-#         }
-#       }
-#       spec {
-#         image_pull_secrets {
-#           name = kubernetes_secret.ghcr_auth.metadata[0].name
-#         }
-#         container {
-#           image = "ghcr.io/trailofbits/afc-crs-trail-of-bits/orchestrator:latest"
-#           name  = "orchestrator-container"
-#           port {
-#             container_port = 8000
-#           }
-#         }
-#       }
-#     }
-#   }
-# }
 
-# resource "kubernetes_service" "orchestrator" {
-#   metadata {
-#     name      = "orchestrator"
-#     namespace = kubernetes_namespace.crs-ns.metadata.0.name
-#   }
-#   spec {
-#     selector = {
-#       app = kubernetes_deployment.orchestrator.spec.0.template.0.metadata.0.labels.app
-#     }
-#     type = "NodePort"
-#     port {
-#       node_port   = 30201
-#       port        = 8000
-#       target_port = 8000
-#     }
-#   }
-# }
+# Get AKS credentials and verify connectivity
+resource "null_resource" "setup_kubectl" {
+  depends_on = [azurerm_kubernetes_cluster.primary]
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      # Get credentials and verify connectivity
+      echo "Getting AKS credentials..."
+      az aks get-credentials --resource-group ${azurerm_resource_group.rg.name} --name ${azurerm_kubernetes_cluster.primary.name} --overwrite-existing
+      
+      echo "Verifying Kubernetes connectivity..."
+      for i in {1..12}; do
+        if kubectl cluster-info; then
+          echo "Kubernetes cluster connectivity verified"
+          exit 0
+        fi
+        echo "Waiting for Kubernetes API to become available... attempt $i"
+        sleep 10
+      done
+      echo "Failed to connect to Kubernetes API after multiple attempts"
+      exit 1
+    EOT
+  }
+}
+
+
+# TODO: Consider if we should use Azure Application Gateway for TLS Termination with AKS instead (remove Let's Encrypt)
+# NGINX Ingress Controller
+resource "helm_release" "nginx_ingress" {
+  name       = "nginx-ingress"
+  repository = "https://kubernetes.github.io/ingress-nginx"
+  chart      = "ingress-nginx"
+  namespace  = kubernetes_namespace.crs-ns.metadata[0].name
+  depends_on = [null_resource.setup_kubectl]
+
+  set {
+    name  = "controller.service.type"
+    value = "LoadBalancer"
+  }
+
+  set {
+    name  = "controller.service.annotations.service\\.beta\\.kubernetes\\.io/azure-dns-label-name"
+    value = "bc-test"
+  }
+  
+  # Configure Azure Load Balancer to use the built-in /healthz endpoint
+  set {
+    name  = "controller.service.annotations.service\\.beta\\.kubernetes\\.io/azure-load-balancer-health-probe-request-path"
+    value = "/healthz"
+  }
+  
+  # Enable TLS termination in NGINX but allow HTTP for ACME challenges
+  set {
+    name  = "controller.config.ssl-redirect"
+    value = "false"
+  }
+  
+  # Add annotations to allow HTTP01 challenge
+  set {
+    name  = "controller.config.annotation-value-word-blocklist"
+    value = ""
+  }
+}
+
+
+
+# Install cert-manager for Let's Encrypt certificate handling
+resource "helm_release" "cert_manager" {
+  name       = "cert-manager"
+  repository = "https://charts.jetstack.io"
+  chart      = "cert-manager"
+  namespace  = kubernetes_namespace.crs-ns.metadata[0].name
+  depends_on = [null_resource.setup_kubectl]
+  version    = "v1.14.4"
+
+  set {
+    name  = "installCRDs"
+    value = "true"
+  }
+}
+
+# Wait for cert-manager to be fully deployed and CRDs to be established
+resource "null_resource" "wait_for_cert_manager" {
+  depends_on = [helm_release.cert_manager]
+  
+  provisioner "local-exec" {
+    command = <<-EOT
+      # Wait for cert-manager deployments
+      echo "Waiting for cert-manager deployments..."
+      kubectl wait --for=condition=Available deployment/cert-manager -n ${kubernetes_namespace.crs-ns.metadata[0].name} --timeout=180s
+      kubectl wait --for=condition=Available deployment/cert-manager-webhook -n ${kubernetes_namespace.crs-ns.metadata[0].name} --timeout=180s
+      kubectl wait --for=condition=Available deployment/cert-manager-cainjector -n ${kubernetes_namespace.crs-ns.metadata[0].name} --timeout=180s
+      
+      # Wait for critical CRDs
+      echo "Waiting for cert-manager CRDs..."
+      kubectl wait --for=condition=established crd/clusterissuers.cert-manager.io --timeout=60s
+      kubectl wait --for=condition=established crd/certificates.cert-manager.io --timeout=60s
+    EOT
+  }
+}
+
+# Create the appropriate ClusterIssuer based on the environment variable
+resource "null_resource" "create_cluster_issuer" {
+  depends_on = [null_resource.wait_for_cert_manager]
+  
+  provisioner "local-exec" {
+    command = <<-EOT
+      # Create the selected ClusterIssuer
+      cat << EOF | kubectl apply -f -
+      apiVersion: cert-manager.io/v1
+      kind: ClusterIssuer
+      metadata:
+        name: ${local.cluster_issuer_name}
+      spec:
+        acme:
+          server: ${var.use_production_certificates ? "https://acme-v02.api.letsencrypt.org/directory" : "https://acme-staging-v02.api.letsencrypt.org/directory"}
+          email: ${var.email_address}
+          privateKeySecretRef:
+            name: ${local.cluster_issuer_name}-account-key
+          solvers:
+          - http01:
+              ingress:
+                class: nginx
+      EOF
+      
+      # Wait for the ClusterIssuer to be ready
+      echo "Waiting for ClusterIssuer ${local.cluster_issuer_name} to be ready..."
+      kubectl wait --for=condition=Ready clusterissuer/${local.cluster_issuer_name} --timeout=60s
+    EOT
+  }
+}
+
+# Set local variables for certificate configuration
+locals {
+  cluster_issuer_name = var.use_production_certificates ? "letsencrypt-production" : "letsencrypt-staging"
+  certificate_domain = "bc-test.${azurerm_resource_group.rg.location}.cloudapp.azure.com"
+}
+
+
+resource "kubernetes_ingress_v1" "app_ingress" {
+  metadata {
+    name = "bc-test-ingress"
+    namespace = kubernetes_namespace.crs-ns.metadata[0].name
+    annotations = {
+      "kubernetes.io/ingress.class" = "nginx"
+      "cert-manager.io/cluster-issuer" = local.cluster_issuer_name
+      "nginx.ingress.kubernetes.io/ssl-redirect" = "false"
+    }
+  }
+
+  spec {
+    tls {
+      hosts = [local.certificate_domain]
+      secret_name = "bc-test-tls-secret"
+    }
+    
+    rule {
+      host = local.certificate_domain
+      http {
+        path {
+          path = "/"
+          path_type = "Prefix"
+          
+          backend {
+            service {
+              name = "task-server"
+              port {
+                number = 8000
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  depends_on = [
+    helm_release.nginx_ingress,
+    helm_release.buttercup,
+    null_resource.create_cluster_issuer
+  ]
+}
+
