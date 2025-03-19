@@ -1,6 +1,6 @@
 import pytest
 from redis import Redis
-from buttercup.common.sets import RedisSet
+from buttercup.common.sets import RedisSet, RedisBoolFlag
 
 
 @pytest.fixture
@@ -71,3 +71,20 @@ def test_redis_set_iteration_and_length(redis_client):
 
     # Clean up
     redis_client.delete("test_set_iter")
+
+
+def test_redis_bool_flag(redis_client):
+    flag_name = "test_bool_flag"
+
+    # Initially the flag should be false
+    assert not RedisBoolFlag.is_true(redis_client, flag_name)
+
+    # After setting to true, it should remain true
+    RedisBoolFlag.set_true(redis_client, flag_name)
+    assert RedisBoolFlag.is_true(redis_client, flag_name)
+
+    # Clear the Redis value (simulate another service restarting Redis)
+    redis_client.delete(flag_name)
+
+    # Flag should now be false since we've removed it from Redis
+    assert not RedisBoolFlag.is_true(redis_client, flag_name)

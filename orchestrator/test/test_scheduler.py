@@ -1,5 +1,5 @@
 import pytest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, patch, MagicMock
 from redis import Redis
 
 from buttercup.common.datastructures.msg_pb2 import Task, TaskReady, SourceDetail, BuildOutput, WeightedHarness
@@ -7,7 +7,8 @@ from buttercup.common.maps import BUILD_TYPES
 from buttercup.common.task_meta import TaskMeta
 
 from buttercup.common.queues import RQItem
-from buttercup.orchestrator.scheduler.scheduler import Scheduler
+from buttercup.orchestrator.scheduler.scheduler import Scheduler, CompetitionApiConnectionError
+from buttercup.orchestrator.competition_api_client.models.types_ping_response import TypesPingResponse
 
 import tempfile
 from pathlib import Path
@@ -21,6 +22,18 @@ def mock_redis():
 @pytest.fixture
 def scheduler(mock_redis, tmp_path):
     return Scheduler(tasks_storage_dir=tmp_path, scratch_dir=tmp_path, redis=mock_redis)
+
+
+@pytest.fixture
+def scheduler_for_api_tests(mock_redis, tmp_path):
+    return Scheduler(
+        tasks_storage_dir=tmp_path,
+        scratch_dir=tmp_path,
+        redis=mock_redis,
+        competition_api_url="http://test-competition-api",
+        competition_api_key_id="test_key_id",
+        competition_api_key_token="test_key_token",
+    )
 
 
 @pytest.mark.skip(reason="Not implemented")
@@ -567,3 +580,62 @@ def test_serve_ready_task_cancelled_task(mock_challenge_task, scheduler):
 
     # Restore the original method
     scheduler.should_stop_processing = original_should_stop_processing
+
+
+@patch("buttercup.orchestrator.scheduler.scheduler.create_api_client")
+@patch("buttercup.orchestrator.scheduler.scheduler.PingApi")
+def test_wait_for_competition_api_success(mock_ping_api_class, mock_create_api_client, scheduler_for_api_tests):
+    # Setup mock response
+    mock_ping_api = MagicMock()
+    mock_ping_api_class.return_value = mock_ping_api
+
+    mock_response = TypesPingResponse(status="ok")
+    mock_ping_api.v1_ping_get.return_value = mock_response
+
+    # Setup Redis mock for flag checking and setting
+    scheduler_for_api_tests.redis.get.return_value = None  # Flag not set initially
+
+    # Call the function
+    scheduler_for_api_tests.wait_for_competition_api(retry_interval_seconds=0.1, timeout_seconds=1.0)
+
+    # Verify the flag was set in Redis
+    scheduler_for_api_tests.redis.set.assert_called_once_with(scheduler_for_api_tests.COMPETITION_API_READY_FLAG, "1")
+
+    # Verify the API client was created and ping was called
+    mock_create_api_client.assert_called_once_with("http://test-competition-api", "test_key_id", "test_key_token")
+    mock_ping_api.v1_ping_get.assert_called()
+
+
+@patch("buttercup.orchestrator.scheduler.scheduler.create_api_client")
+@patch("buttercup.orchestrator.scheduler.scheduler.PingApi")
+def test_wait_for_competition_api_timeout(mock_ping_api_class, mock_create_api_client, scheduler_for_api_tests):
+    # Setup mock to simulate connection failure
+    mock_ping_api = MagicMock()
+    mock_ping_api_class.return_value = mock_ping_api
+    mock_ping_api.v1_ping_get.side_effect = Exception("Connection failed")
+
+    # Setup Redis mock for flag checking
+    scheduler_for_api_tests.redis.get.return_value = None  # Flag not set initially
+
+    # Attempt to call the function, should raise an exception
+    with pytest.raises(CompetitionApiConnectionError):
+        scheduler_for_api_tests.wait_for_competition_api(retry_interval_seconds=0.1, timeout_seconds=0.5)
+
+    # Verify the flag was NOT set in Redis
+    scheduler_for_api_tests.redis.set.assert_not_called()
+
+
+@patch("buttercup.orchestrator.scheduler.scheduler.create_api_client")
+@patch("buttercup.orchestrator.scheduler.scheduler.PingApi")
+def test_wait_for_competition_api_flag_already_set(
+    mock_ping_api_class, mock_create_api_client, scheduler_for_api_tests
+):
+    # Setup Redis mock to indicate flag is already set
+    scheduler_for_api_tests.redis.get.return_value = b"1"  # Flag already set
+
+    # Call the function
+    scheduler_for_api_tests.wait_for_competition_api()
+
+    # Verify that the API client was not created and ping was not called
+    mock_create_api_client.assert_not_called()
+    mock_ping_api_class.assert_not_called()

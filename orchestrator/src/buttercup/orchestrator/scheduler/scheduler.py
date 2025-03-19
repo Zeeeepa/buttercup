@@ -1,4 +1,5 @@
 import logging
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Set, Union
@@ -15,6 +16,7 @@ from buttercup.common.datastructures.msg_pb2 import (
     IndexRequest,
 )
 from buttercup.common.project_yaml import ProjectYaml
+from buttercup.common.sets import RedisBoolFlag
 from buttercup.orchestrator.scheduler.cancellation import Cancellation
 from buttercup.orchestrator.scheduler.vulnerabilities import Vulnerabilities
 from clusterfuzz.fuzz import get_fuzz_targets
@@ -22,7 +24,15 @@ from buttercup.orchestrator.scheduler.patches import Patches
 from buttercup.orchestrator.api_client_factory import create_api_client
 from buttercup.common.utils import serve_loop
 from buttercup.orchestrator.registry import TaskRegistry
+from buttercup.orchestrator.competition_api_client.api.ping_api import PingApi
 import random
+
+
+class CompetitionApiConnectionError(Exception):
+    """Exception raised when the competition API cannot be reached within the timeout period."""
+
+    pass
+
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +95,56 @@ class Scheduler:
         if self.task_registry is None:
             return False
         return self.task_registry.should_stop_processing(task_or_id, self.cached_cancelled_ids)
+
+    # Name of the Redis flag that indicates the competition API is ready
+    COMPETITION_API_READY_FLAG = "competition_api_ready"
+
+    def wait_for_competition_api(self, retry_interval_seconds: float = 5.0, timeout_seconds: float = 300.0) -> None:
+        """
+        Blocks until the competition API can be successfully pinged.
+        Once successful, sets a Redis flag indicating the API is ready.
+
+        Args:
+            retry_interval_seconds: Time to wait between ping attempts
+            timeout_seconds: Maximum time to wait before giving up
+
+        Raises:
+            CompetitionApiConnectionError: If the connection to the API cannot be established within timeout
+        """
+        if self.redis is None:
+            raise ValueError("Redis client not available, cannot check/set API ready flag")
+
+        # First check if the flag is already set
+        if RedisBoolFlag.is_true(self.redis, self.COMPETITION_API_READY_FLAG):
+            logger.info("Competition API ready flag already set, skipping ping check")
+            return
+
+        logger.info(f"Waiting for competition API at {self.competition_api_url} to become available...")
+
+        # Create API client for pinging
+        api_client = create_api_client(
+            self.competition_api_url, self.competition_api_key_id, self.competition_api_key_token
+        )
+        ping_api = PingApi(api_client)
+
+        start_time = time.time()
+        while (time.time() - start_time) < timeout_seconds:
+            try:
+                # Attempt to ping the API
+                response = ping_api.v1_ping_get(_request_timeout=10.0)  # 10 second timeout for each request
+                if response.status == "ok":
+                    logger.info("Successfully connected to competition API")
+                    # Set the flag in Redis
+                    RedisBoolFlag.set_true(self.redis, self.COMPETITION_API_READY_FLAG)
+                    return
+            except Exception as e:
+                logger.debug(f"Failed to connect to competition API: {str(e)}")
+
+            # Wait before trying again
+            time.sleep(retry_interval_seconds)
+
+        # If we reach here, the timeout has expired
+        raise CompetitionApiConnectionError(f"Timed out waiting for competition API after {timeout_seconds} seconds")
 
     def __post_init__(self):
         if self.redis is not None:
