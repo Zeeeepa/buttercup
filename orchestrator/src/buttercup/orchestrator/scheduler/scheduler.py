@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Set, Union
 from redis import Redis
+from urllib3.exceptions import MaxRetryError, NewConnectionError
 from buttercup.common.queues import ReliableQueue, QueueFactory, RQItem, QueueNames, GroupNames
 from buttercup.common.maps import HarnessWeights, BuildMap, BUILD_TYPES
 from buttercup.common.challenge_task import ChallengeTask
@@ -27,7 +28,8 @@ from buttercup.common.utils import serve_loop
 from buttercup.orchestrator.registry import TaskRegistry
 from buttercup.orchestrator.competition_api_client.api.ping_api import PingApi
 import random
-from buttercup.orchestrator.competition_api_client.rest import ApiException
+from buttercup.orchestrator.competition_api_client.api_client import ApiClient
+from buttercup.orchestrator.competition_api_client.models.types_ping_response import TypesPingResponse
 
 
 class CompetitionApiConnectionError(Exception):
@@ -62,6 +64,7 @@ class Scheduler:
     patches: Patches = field(init=False)
     task_registry: TaskRegistry | None = field(init=False, default=None)
     cached_cancelled_ids: Set[str] = field(init=False, default_factory=set)
+    api_client: ApiClient | None = field(init=False, default=None)
 
     def update_cached_cancelled_ids(self) -> bool:
         """Update the cached set of cancelled task IDs.
@@ -121,23 +124,22 @@ class Scheduler:
         logger.info(f"Waiting for competition API at {self.competition_api_url} to become available...")
 
         # Create API client for pinging
-        api_client = create_api_client(
-            self.competition_api_url, self.competition_api_key_id, self.competition_api_key_token
-        )
-        ping_api = PingApi(api_client)
+        ping_api = PingApi(self.api_client)
 
         start_time = time.time()
         while (time.time() - start_time) < self.competition_api_timeout_seconds:
             try:
-                # Attempt to ping the API
-                response = ping_api.v1_ping_get(_request_timeout=10.0)  # 10 second timeout for each request
-                logger.info(f"Competition API response: {response}")
-                # Any successful HTTP response (200) means the API is up and running, so we can proceed
-                # Set the flag in Redis
-                RedisBoolFlag.set_true(self.redis, COMPETITION_API_READY_FLAG)
-                return
-            except ApiException as e:
-                logger.warning(f"Competition API returned non-200 status code: {e}")
+                response = None
+                try:
+                    response: TypesPingResponse = ping_api.v1_ping_get(_request_timeout=10.0)
+                except (MaxRetryError, NewConnectionError) as e:
+                    logger.warning(f"Failed to ping competition API: {e}")
+
+                if isinstance(response, TypesPingResponse):
+                    if response.status:
+                        RedisBoolFlag.set_true(self.redis, COMPETITION_API_READY_FLAG)
+                        logger.info("Competition API is ready")
+                        return
             except Exception as e:
                 logger.debug(f"Failed to connect to competition API: {str(e)}")
 
@@ -152,12 +154,12 @@ class Scheduler:
     def __post_init__(self):
         if self.redis is not None:
             queue_factory = QueueFactory(self.redis)
-            api_client = create_api_client(
+            self.api_client = create_api_client(
                 self.competition_api_url, self.competition_api_key_id, self.competition_api_key_token
             )
             # Input queues are non-blocking as we're already sleeping between iterations
             self.cancellation = Cancellation(redis=self.redis)
-            self.vulnerabilities = Vulnerabilities(redis=self.redis, api_client=api_client)
+            self.vulnerabilities = Vulnerabilities(redis=self.redis, api_client=self.api_client)
             self.ready_queue = queue_factory.create(QueueNames.READY_TASKS, GroupNames.ORCHESTRATOR, block_time=None)
             self.build_requests_queue = queue_factory.create(QueueNames.BUILD, block_time=None)
             self.build_output_queue = queue_factory.create(
@@ -169,7 +171,7 @@ class Scheduler:
             )
             self.harness_map = HarnessWeights(self.redis)
             self.build_map = BuildMap(self.redis)
-            self.patches = Patches(redis=self.redis, api_client=api_client)
+            self.patches = Patches(redis=self.redis, api_client=self.api_client)
             self.task_registry = TaskRegistry(self.redis)
 
     def select_preferred(self, available_options: list[str], preferred_order: list[str]) -> str:

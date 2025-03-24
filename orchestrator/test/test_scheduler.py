@@ -584,9 +584,8 @@ def test_serve_ready_task_cancelled_task(mock_challenge_task, scheduler):
     scheduler.should_stop_processing = original_should_stop_processing
 
 
-@patch("buttercup.orchestrator.scheduler.scheduler.create_api_client")
 @patch("buttercup.orchestrator.scheduler.scheduler.PingApi")
-def test_wait_for_competition_api_success(mock_ping_api_class, mock_create_api_client, scheduler_for_api_tests):
+def test_wait_for_competition_api_success(mock_ping_api_class, scheduler_for_api_tests):
     # Setup mock response
     mock_ping_api = MagicMock()
     mock_ping_api_class.return_value = mock_ping_api
@@ -603,14 +602,12 @@ def test_wait_for_competition_api_success(mock_ping_api_class, mock_create_api_c
     # Verify the flag was set in Redis
     scheduler_for_api_tests.redis.set.assert_called_once_with(COMPETITION_API_READY_FLAG, "1")
 
-    # Verify the API client was created and ping was called
-    mock_create_api_client.assert_called_once_with("http://test-competition-api", "test_key_id", "test_key_token")
+    # Verify ping was called with the existing api_client
     mock_ping_api.v1_ping_get.assert_called()
 
 
-@patch("buttercup.orchestrator.scheduler.scheduler.create_api_client")
 @patch("buttercup.orchestrator.scheduler.scheduler.PingApi")
-def test_wait_for_competition_api_timeout(mock_ping_api_class, mock_create_api_client, scheduler_for_api_tests):
+def test_wait_for_competition_api_timeout(mock_ping_api_class, scheduler_for_api_tests):
     # Setup mock to simulate connection failure
     mock_ping_api = MagicMock()
     mock_ping_api_class.return_value = mock_ping_api
@@ -627,17 +624,13 @@ def test_wait_for_competition_api_timeout(mock_ping_api_class, mock_create_api_c
     scheduler_for_api_tests.redis.set.assert_not_called()
 
 
-@patch("buttercup.orchestrator.scheduler.scheduler.create_api_client")
 @patch("buttercup.orchestrator.scheduler.scheduler.PingApi")
-def test_wait_for_competition_api_flag_already_set(
-    mock_ping_api_class, mock_create_api_client, scheduler_for_api_tests
-):
+def test_wait_for_competition_api_flag_already_set(mock_ping_api_class, scheduler_for_api_tests):
     # Setup Redis mock to indicate flag is already set
     scheduler_for_api_tests.redis.get.return_value = b"1"  # Flag already set
 
     # Call the function
     scheduler_for_api_tests.wait_for_competition_api()
 
-    # Verify that the API client was not created and ping was not called
-    mock_create_api_client.assert_not_called()
+    # Verify that ping was not called
     mock_ping_api_class.assert_not_called()
