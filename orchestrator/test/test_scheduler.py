@@ -12,6 +12,7 @@ from buttercup.orchestrator.competition_api_client.models.types_ping_response im
 
 import tempfile
 from pathlib import Path
+from buttercup.common.constants import COMPETITION_API_READY_FLAG
 
 
 @pytest.fixture
@@ -33,6 +34,7 @@ def scheduler_for_api_tests(mock_redis, tmp_path):
         competition_api_url="http://test-competition-api",
         competition_api_key_id="test_key_id",
         competition_api_key_token="test_key_token",
+        competition_api_timeout_seconds=1.0,  # Short timeout for tests
     )
 
 
@@ -427,7 +429,7 @@ def test_serve_item_processes_cancellations_then_updates_cache(scheduler):
     # Verify all mocks were called once
     for mock_name, mock_obj in [
         ("process_cancellations", mock_process_cancellations),
-        ("update_cached_ids", mock_update_cached_ids),
+        ("update_cache", mock_update_cached_ids),
         ("serve_ready_task", mock_serve_ready_task),
         ("serve_build_output", mock_serve_build_output),
         ("serve_index_output", mock_serve_index_output),
@@ -596,10 +598,10 @@ def test_wait_for_competition_api_success(mock_ping_api_class, mock_create_api_c
     scheduler_for_api_tests.redis.get.return_value = None  # Flag not set initially
 
     # Call the function
-    scheduler_for_api_tests.wait_for_competition_api(retry_interval_seconds=0.1, timeout_seconds=1.0)
+    scheduler_for_api_tests.wait_for_competition_api(retry_interval_seconds=0.1)
 
     # Verify the flag was set in Redis
-    scheduler_for_api_tests.redis.set.assert_called_once_with(scheduler_for_api_tests.COMPETITION_API_READY_FLAG, "1")
+    scheduler_for_api_tests.redis.set.assert_called_once_with(COMPETITION_API_READY_FLAG, "1")
 
     # Verify the API client was created and ping was called
     mock_create_api_client.assert_called_once_with("http://test-competition-api", "test_key_id", "test_key_token")
@@ -619,7 +621,7 @@ def test_wait_for_competition_api_timeout(mock_ping_api_class, mock_create_api_c
 
     # Attempt to call the function, should raise an exception
     with pytest.raises(CompetitionApiConnectionError):
-        scheduler_for_api_tests.wait_for_competition_api(retry_interval_seconds=0.1, timeout_seconds=0.5)
+        scheduler_for_api_tests.wait_for_competition_api(retry_interval_seconds=0.1)
 
     # Verify the flag was NOT set in Redis
     scheduler_for_api_tests.redis.set.assert_not_called()

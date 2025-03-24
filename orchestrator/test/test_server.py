@@ -5,6 +5,7 @@ import time
 from fastapi.testclient import TestClient
 from unittest.mock import MagicMock
 from fastapi.encoders import jsonable_encoder
+from redis import Redis
 from buttercup.orchestrator.task_server.models.types import (
     Task,
     TaskDetail,
@@ -35,13 +36,15 @@ settings = TestSettings()
 monkeypatch.setattr("buttercup.orchestrator.task_server.dependencies.get_settings", lambda: settings)
 
 from buttercup.orchestrator.task_server.server import app  # noqa: E402
-from buttercup.orchestrator.task_server.dependencies import get_task_queue, get_delete_task_queue  # noqa: E402
+from buttercup.orchestrator.task_server.dependencies import get_task_queue, get_delete_task_queue, get_redis  # noqa: E402
 
 # Create mock queue and override FastAPI dependency
 mock_tasks_queue = MagicMock()
 mock_delete_task_queue = MagicMock()
+mock_redis = MagicMock(spec=Redis)  # Use spec to ensure Redis interface is followed
 app.dependency_overrides[get_task_queue] = lambda: mock_tasks_queue
 app.dependency_overrides[get_delete_task_queue] = lambda: mock_delete_task_queue
+app.dependency_overrides[get_redis] = lambda: mock_redis
 
 
 @pytest.fixture
@@ -60,10 +63,29 @@ def test_get_status_unauthorized(client: TestClient) -> None:
 
 def test_get_status_authorized(client: TestClient) -> None:
     """Test that status endpoint works with valid credentials"""
+    # Setup Redis mock to return None for the ready flag
+    mock_redis.get.return_value = None
+
     response = client.get("/status/", auth=(settings.api_key_id, settings.api_token))
     assert response.status_code == 200
     assert isinstance(response.json(), dict)
     assert not response.json()["ready"]
+    assert response.json()["since"] > 0
+    assert response.json()["state"]["tasks"]["canceled"] == 0
+    assert response.json()["state"]["tasks"]["errored"] == 0
+    assert response.json()["state"]["tasks"]["failed"] == 0
+    assert response.json()["state"]["tasks"]["pending"] == 0
+
+
+def test_get_status_authorized_api_ready(client: TestClient) -> None:
+    """Test that status endpoint correctly reports when API is ready"""
+    # Setup Redis mock to return True for the ready flag
+    mock_redis.get.return_value = b"1"
+
+    response = client.get("/status/", auth=(settings.api_key_id, settings.api_token))
+    assert response.status_code == 200
+    assert isinstance(response.json(), dict)
+    assert response.json()["ready"]  # API should be reported as ready
     assert response.json()["since"] > 0
     assert response.json()["state"]["tasks"]["canceled"] == 0
     assert response.json()["state"]["tasks"]["errored"] == 0

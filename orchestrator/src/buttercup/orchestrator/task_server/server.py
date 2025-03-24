@@ -13,11 +13,17 @@ from argon2.exceptions import VerifyMismatchError
 from fastapi import Depends, FastAPI, status, HTTPException
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field
+from redis import Redis
 
 from buttercup.orchestrator.task_server.models.types import Status, Task, SARIFBroadcast, StatusState, StatusTasksState
-from buttercup.orchestrator.task_server.backend import delete_task, new_task, delete_all_tasks
+from buttercup.orchestrator.task_server.backend import delete_task, new_task, delete_all_tasks, get_ready_status
 from buttercup.common.logger import setup_package_logger
-from buttercup.orchestrator.task_server.dependencies import get_delete_task_queue, get_task_queue, get_settings
+from buttercup.orchestrator.task_server.dependencies import (
+    get_delete_task_queue,
+    get_task_queue,
+    get_settings,
+    get_redis,
+)
 from buttercup.orchestrator.task_server.config import TaskServerSettings
 from buttercup.common.queues import ReliableQueue
 
@@ -122,12 +128,13 @@ def check_auth(
 @app.get("/status/", response_model=Status, tags=["status"])
 def get_status_(
     credentials: Annotated[HTTPBasicCredentials, Depends(check_auth)],
+    redis_client: Annotated[Redis, Depends(get_redis)],
 ) -> Status:
     """
     CRS Status
     """
     return Status(
-        ready=False,
+        ready=get_ready_status(redis_client),
         since=int(time.time()),
         state=StatusState(
             tasks=StatusTasksState(

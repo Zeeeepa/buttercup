@@ -13,9 +13,15 @@ from buttercup.common.datastructures.msg_pb2 import (
 )
 from buttercup.common.queues import ReliableQueue
 import logging
+from redis import Redis
+from buttercup.common.sets import RedisBoolFlag
+from buttercup.common.constants import COMPETITION_API_READY_FLAG
 
 
 logger = logging.getLogger(__name__)
+
+# Module-level cache for ready status
+_ready_status_cache = False
 
 
 def _api_task_to_proto(task: Task) -> list[TaskProto]:
@@ -51,6 +57,36 @@ def _api_task_to_proto(task: Task) -> list[TaskProto]:
         res.append(task_proto)
 
     return res
+
+
+def get_ready_status(redis_client: Redis) -> bool:
+    """Check if the system is ready by checking the competition API flag.
+
+    This function implements caching where:
+    - If the system is ready (true), the result is cached in memory and will always return true
+    - If the system is not ready (false), the result is not cached and will be checked again
+
+    Args:
+        redis_client: Redis client to check the flag
+
+    Returns:
+        bool: True if the system is ready, False otherwise
+    """
+    global _ready_status_cache
+
+    # If we've previously determined the system is ready, return cached value
+    if _ready_status_cache:
+        return True
+
+    # Check the actual flag
+    is_ready = RedisBoolFlag.is_true(redis_client, COMPETITION_API_READY_FLAG)
+
+    # If ready and wasn't ready before, log the transition
+    if is_ready and not _ready_status_cache:
+        logger.info("System has become ready")
+        _ready_status_cache = True
+
+    return is_ready
 
 
 def new_task(task: Task, tasks_queue: ReliableQueue) -> str:
