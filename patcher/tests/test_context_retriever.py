@@ -104,22 +104,17 @@ def mock_test_instructions_prompt():
 
 @pytest.fixture(autouse=True)
 def mock_llm_functions(
-    request,
     mock_agent_llm: MagicMock,
     mock_cheap_llm: MagicMock,
     mock_duplicate_code_snippet_prompt: MagicMock,
     mock_test_instructions_prompt: MagicMock,
 ):
     """Mock LLM creation functions and environment variables."""
-    # Skip mocking for integration tests
-    if "integration" in request.node.keywords:
-        yield
-        return
-        
     with (
         patch.dict(os.environ, {"BUTTERCUP_LITELLM_HOSTNAME": "http://test-host", "BUTTERCUP_LITELLM_KEY": "test-key"}),
         patch("buttercup.common.llm.create_default_llm", return_value=mock_cheap_llm),
         patch("buttercup.common.llm.create_llm", return_value=mock_cheap_llm),
+        patch("langgraph.prebuilt.chat_agent_executor._get_prompt_runnable", return_value=mock_agent_llm),
     ):
         import buttercup.patcher.agents.context_retriever
 
@@ -481,11 +476,6 @@ def test_retrieve_context_basic(
     selinux_agent: ContextRetrieverAgent, mock_agent_llm: MagicMock, mock_runnable_config
 ) -> None:
     """Test basic context retrieval functionality."""
-    # Skip this test if codequery is not installed
-    import shutil
-    if not shutil.which("cscope") or not shutil.which("cqmakedb"):
-        pytest.skip("codequery tools (cscope, cqmakedb) not installed")
-    
     # Create a test state with a simple request
     state = ContextRetrieverState(
         code_snippet_requests=[
@@ -496,29 +486,71 @@ def test_retrieve_context_basic(
         prev_node="test_node",
     )
 
-    # For integration tests, we should not mock the LLM responses
-    # The agent should use real LLMs to find the code
-    # However, since this would require API keys and be slow/expensive,
-    # we'll skip this test when running in CI or without proper setup
-    import os
-    if os.environ.get("CI") or not os.environ.get("OPENAI_API_KEY"):
-        pytest.skip("Integration test requires OPENAI_API_KEY and should not run in CI")
-
+    # Execute the retrieve_context method
+    mock_agent_llm.invoke.side_effect = [
+        # First response: Agent decides to use grep to search for the function
+        AIMessage(
+            content="I'll search for the function using grep.",
+            tool_calls=[
+                ToolCall(
+                    id="grep_call_1",
+                    name="grep",
+                    args={
+                        "pattern": "ebitmap_match_any",
+                    },
+                )
+            ],
+        ),
+        # Agent decides to get the function definition
+        AIMessage(
+            content="I found the function. Let me get its definition.",
+            tool_calls=[
+                ToolCall(
+                    id="get_function_call_1",
+                    name="get_function",
+                    args={"function_name": "ebitmap_match_any", "file_path": "libsepol/src/ebitmap.c"},
+                )
+            ],
+        ),
+        AIMessage(
+            content="Let's track the definition",
+            tool_calls=[
+                ToolCall(
+                    id="track_snippet_call_1",
+                    name="track_snippet",
+                    args={
+                        "file_path": "libsepol/src/ebitmap.c",
+                        "start_line": None,
+                        "end_line": None,
+                        "type_name": None,
+                        "function_name": "ebitmap_match_any",
+                        "code_snippet_description": "ebitmap_match_any function definition",
+                    },
+                )
+            ],
+        ),
+        AIMessage(
+            content="I'm done <END>",
+        ),
+    ]
     result = selinux_agent.retrieve_context(state, mock_runnable_config)
 
     # Verify the result
     assert isinstance(result, Command)
     assert result.goto == "test_node"
     assert "relevant_code_snippets" in result.update
-    # The actual agent might find multiple snippets or none depending on execution
-    # We can't guarantee exact results without mocking
-    # assert len(result.update["relevant_code_snippets"]) >= 0
+    assert len(result.update["relevant_code_snippets"]) == 1
+
+    # Verify the code snippet content
+    snippet = next(iter(result.update["relevant_code_snippets"]))
+    assert "ebitmap_match_any" in snippet.code
+    assert "const ebitmap_t *e1" in snippet.code
 
 
 def test_missing_arg_tool_call(
-    mock_agent: ContextRetrieverAgent, mock_cheap_llm: MagicMock, mock_runnable_config
+    mock_agent: ContextRetrieverAgent, mock_agent_llm: MagicMock, mock_runnable_config
 ) -> None:
-    """Test that the retrieve_context method handles tool calls correctly."""
+    """Test basic context retrieval functionality."""
     # Create a test state with a simple request
     state = ContextRetrieverState(
         code_snippet_requests=[
@@ -529,18 +561,71 @@ def test_missing_arg_tool_call(
         prev_node="test_node",
     )
 
-    # The mocking of LangGraph internals is complex and fragile
-    # For now, we'll just test that the method runs without errors
-    # and returns the expected structure
+    # Execute the retrieve_context method
+    mock_agent_llm.invoke.side_effect = [
+        AIMessage(
+            content="I'll list the files in the project.",
+            tool_calls=[
+                ToolCall(
+                    id="list_files_call_1",
+                    name="ls",
+                    args={},  # no args for list_files
+                )
+            ],
+        ),
+        AIMessage(
+            content="Let me pass the path to ls",
+            tool_calls=[
+                ToolCall(
+                    id="ls_call_1",
+                    name="ls",
+                    args={
+                        "path": ".",
+                    },
+                )
+            ],
+        ),
+        AIMessage(
+            content="Let's get the definition",
+            tool_calls=[
+                ToolCall(
+                    id="get_function_call_1",
+                    name="get_function",
+                    args={
+                        "function_name": "main",
+                        "file_path": "test.c",
+                    },
+                )
+            ],
+        ),
+        AIMessage(
+            content="Let's track the definition",
+            tool_calls=[
+                ToolCall(
+                    id="track_snippet_call_1",
+                    name="track_snippet",
+                    args={
+                        "file_path": "test.c",
+                        "start_line": None,
+                        "end_line": None,
+                        "type_name": None,
+                        "function_name": "main",
+                        "code_snippet_description": "main function definition",
+                    },
+                )
+            ],
+        ),
+        AIMessage(
+            content="I'm done <END>",
+        ),
+    ]
     result = mock_agent.retrieve_context(state, mock_runnable_config)
 
-    # Verify the result structure
+    # Verify the result
     assert isinstance(result, Command)
     assert result.goto == "test_node"
     assert "relevant_code_snippets" in result.update
-    # We can't guarantee the exact behavior with mocked LLMs
-    # because LangGraph's internal execution is complex
-    assert isinstance(result.update["relevant_code_snippets"], set)
+    assert len(result.update["relevant_code_snippets"]) == 1
 
 
 def test_recursion_limit(mock_agent: ContextRetrieverAgent, mock_agent_llm: MagicMock, mock_runnable_config) -> None:
