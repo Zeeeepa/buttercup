@@ -1,37 +1,35 @@
-from buttercup.common import node_local
-from buttercup.fuzzing_infra.runner import Runner, Conf, FuzzConfiguration
-from dataclasses import dataclass
-import os
-from buttercup.common.datastructures.msg_pb2 import BuildType, WeightedHarness
-from buttercup.common.datastructures.aliases import BuildType as BuildTypeHint
-from buttercup.common.corpus import Corpus
-from buttercup.common.maps import HarnessWeights, BuildMap
-from buttercup.common.utils import serve_loop, setup_periodic_zombie_reaper
-from buttercup.common.logger import setup_package_logger
-from redis import Redis
-from typing import List
-from os import PathLike
-import random
-from buttercup.common.datastructures.msg_pb2 import BuildOutput
+import datetime
 import logging
-from buttercup.common.challenge_task import ChallengeTask
-from buttercup.fuzzing_infra.settings import FuzzerBotSettings
-from buttercup.common.sets import MergedCorpusSetLock
-from buttercup.common.constants import ADDRESS_SANITIZER
-from buttercup.common.sets import FailedToAcquireLock
-from buttercup.common.sets import MERGING_LOCK_TIMEOUT_SECONDS
-from buttercup.common.telemetry import init_telemetry
+import os
+import random
+import shutil
+from dataclasses import dataclass
+from os import PathLike
+
 from opentelemetry import trace
 from opentelemetry.trace import Status, StatusCode
-from buttercup.common.telemetry import set_crs_attributes, CRSActionCategory
-import datetime
-import shutil
+from redis import Redis
+
+from buttercup.common import node_local
+from buttercup.common.challenge_task import ChallengeTask
+from buttercup.common.constants import ADDRESS_SANITIZER
+from buttercup.common.corpus import Corpus
+from buttercup.common.datastructures.aliases import BuildType as BuildTypeHint
+from buttercup.common.datastructures.msg_pb2 import BuildOutput, BuildType, WeightedHarness
+from buttercup.common.logger import setup_package_logger
+from buttercup.common.maps import BuildMap, HarnessWeights
+from buttercup.common.sets import MERGING_LOCK_TIMEOUT_SECONDS, FailedToAcquireLock, MergedCorpusSetLock
+from buttercup.common.telemetry import CRSActionCategory, init_telemetry, set_crs_attributes
+from buttercup.common.utils import serve_loop, setup_periodic_zombie_reaper
+from buttercup.fuzzing_infra.runner import Conf, FuzzConfiguration, Runner
+from buttercup.fuzzing_infra.settings import FuzzerBotSettings
 
 logger = logging.getLogger(__name__)
 
 # NOTE: The idea of using three distinct classes to represent the local, remote, and merged corpuses
 #       is to make the code more readable and easier to understand.
-#       The BaseCorpus class is used to represent the initial corpus state, before any merge operations have been performed.
+#       The BaseCorpus class is used to represent the initial corpus state,
+#       before any merge operations have been performed.
 #       The PartitionedCorpus class is used to partition the corpus into local and remote parts.
 #       The FinalCorpus class is used to represent the corpus after the merge operation has been performed.
 
@@ -97,7 +95,7 @@ class PartitionedCorpus:
 
         for file in local_files_list:
             try:
-                shutil.copy(os.path.join(self.corpus.path, file), os.path.join(str(self.local_dir), file))
+                shutil.copy(os.path.join(self.corpus.path, file), os.path.join(self.local_dir, file))
                 new_local_only_files.add(file)
                 if len(new_local_only_files) >= self.max_local_files:
                     break
@@ -111,10 +109,10 @@ class PartitionedCorpus:
 
         for file in self.remote_files:
             try:
-                shutil.copy(os.path.join(self.corpus.path, file), os.path.join(str(self.remote_dir), file))
+                shutil.copy(os.path.join(self.corpus.path, file), os.path.join(self.remote_dir, file))
             except Exception as e:
                 # Copy this from the remote storage instead (slow, but shouldn't dissappear from there)
-                shutil.copy(os.path.join(self.corpus.remote_path, file), os.path.join(str(self.remote_dir), file))
+                shutil.copy(os.path.join(self.corpus.remote_path, file), os.path.join(self.remote_dir, file))
                 logger.debug(f"Error copying file {file} to remote directory: {e}. Copied from remote storage instead.")
 
     def to_final(self) -> FinalCorpus:
@@ -125,10 +123,10 @@ class PartitionedCorpus:
         Will rehash any files in the remote_directory as the merge operation may have changed the file names.
         Then it will partition the files into push_remotely and delete_locally sets and return a FinalCorpus object.
         """
-        self.corpus.hash_corpus(str(self.remote_dir))
+        self.corpus.hash_corpus(os.fspath(self.remote_dir))
 
         # Partition the files into push_remotely and delete_locally sets
-        files_in_new_remote_dir = set(os.listdir(str(self.remote_dir)))
+        files_in_new_remote_dir = set(os.listdir(self.remote_dir))
 
         # All remote files must still be in merged files
         assert self.remote_files.issubset(files_in_new_remote_dir), "Some remote files were lost during merge"
@@ -202,7 +200,7 @@ class MergerBot:
         self.builds = BuildMap(redis)
         self.max_local_files = max_local_files
 
-    def required_builds(self) -> List[BuildTypeHint]:
+    def required_builds(self) -> list[BuildTypeHint]:
         return [BuildType.FUZZER]
 
     def _run_merge_operation(
@@ -237,7 +235,7 @@ class MergerBot:
 
                 # Run merge from local_dir to remote_dir to find which files add coverage
                 fuzz_conf = FuzzConfiguration(
-                    str(local_dir),
+                    os.fspath(local_dir),
                     str(build_dir / task.harness_name),
                     build.engine,
                     build.sanitizer,
@@ -263,8 +261,9 @@ class MergerBot:
                         },
                     )
 
-                    # We specify the remote_dir as the target dir as that will cause any `local_dir` files that adds coverage to be moved to remote_dir.
-                    self.runner.merge_corpus(fuzz_conf, str(remote_dir))
+                    # We specify the remote_dir as the target dir as that will cause any `local_dir`
+                    # files that adds coverage to be moved to remote_dir.
+                    self.runner.merge_corpus(fuzz_conf, os.fspath(remote_dir))
                     span.set_status(Status(StatusCode.OK))
 
     def run_task(self, task: WeightedHarness, builds: list[BuildOutput]) -> bool:
@@ -273,7 +272,8 @@ class MergerBot:
         Given a task/WeightedHarness, we want to merge the local corpus into the remote corpus if it adds coverage
            - acquire a lock on the merged corpus set, if not possible, return and move on to next task
            - ensure all of the remotely stored corpus files are available locally
-           - partition the the local corpus into R and L, where R is the remote corpus and L is the local corpus excluding remote files (L = local_files - remote_files)
+           - partition the the local corpus into R and L, where R is the remote corpus and L is
+             the local corpus excluding remote files (L = local_files - remote_files)
            - if L is empty the node is up to date, release the lock and move on to next task.
            - copy the local corpus into R and L directories respectively
            - run merger on R and L, moving files from L to R if they add coverage
@@ -309,12 +309,14 @@ class MergerBot:
                     # If L is empty, the node is up to date
                     if not partitioned_corpus.local_only_files:
                         logger.debug(
-                            f"Skipping merge for {task.harness_name} | {task.package_name} | {task.task_id} because local corpus is up to date"
+                            f"Skipping merge for {task.harness_name} | {task.package_name} | "
+                            f"{task.task_id} because local corpus is up to date"
                         )
                         return False  # We did not do any work
 
                     logger.info(
-                        f"Found {len(partitioned_corpus.local_only_files)} files only in local corpus for {task.harness_name}. Will run merge operation."
+                        f"Found {len(partitioned_corpus.local_only_files)} files only in local corpus "
+                        f"for {task.harness_name}. Will run merge operation."
                     )
 
                     try:
@@ -351,7 +353,8 @@ class MergerBot:
 
         except FailedToAcquireLock:
             logger.debug(
-                f"Skipping merge for {task.harness_name} | {task.package_name} | {task.task_id} because another worker is already merging"
+                f"Skipping merge for {task.harness_name} | {task.package_name} | {task.task_id} "
+                f"because another worker is already merging"
             )
         except Exception as e:
             logger.error(f"Error merging corpus: {e}")

@@ -46,8 +46,8 @@ def mock_challenge_task(tmp_path):
 language: c
 """)
 
-    # Create a mock helper.py in infra/infra/helper.py
-    helper_path = task_dir / "fuzz-tooling" / "infra" / "infra" / "helper.py"
+    # Create a mock helper.py in projects/infra/helper.py
+    helper_path = task_dir / "fuzz-tooling" / "projects" / "infra" / "helper.py"
     helper_path.parent.mkdir(parents=True)
     helper_path.write_text("import sys; sys.exit(0)")
 
@@ -99,8 +99,8 @@ def mock_challenge_task_with_diff(tmp_path):
 language: c
 """)
 
-    # Create a mock helper.py in infra/infra/helper.py
-    helper_path = task_dir / "fuzz-tooling" / "infra" / "infra" / "helper.py"
+    # Create a mock helper.py in projects/infra/helper.py
+    helper_path = task_dir / "fuzz-tooling" / "projects" / "infra" / "helper.py"
     helper_path.parent.mkdir(parents=True)
     helper_path.write_text("import sys; sys.exit(0)")
 
@@ -303,16 +303,12 @@ def mock_codequery_responses():
 def mock_challenge_task_responses():
     """Create mock challenge task responses."""
     return {
-        "exec_docker_cmd": MagicMock(
-            success=True, output=b"int target_function(char* input) { /* function body */ }"
-        )
+        "exec_docker_cmd": MagicMock(success=True, output=b"int target_function(char* input) { /* function body */ }")
     }
 
 
 def pytest_addoption(parser):
-    parser.addoption(
-        "--runintegration", action="store_true", default=False, help="run integration tests"
-    )
+    parser.addoption("--runintegration", action="store_true", default=False, help="run integration tests")
 
 
 def pytest_configure(config):
